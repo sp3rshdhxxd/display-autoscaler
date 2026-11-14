@@ -1,5 +1,7 @@
 # display-autoscaler Implementation Plan
 
+> Historical implementation plan. The current behavior and limitations are documented in `README.md` and `docs/specs/2026-06-11-display-autoscaler-design.md`; references below to private SkyLight APIs and the original installer are superseded.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a zero-UI Swift utility that runs as a LaunchAgent to automatically detect external displays and set optimal/preferred HiDPI resolutions using private SkyLight APIs.

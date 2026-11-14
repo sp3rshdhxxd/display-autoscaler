@@ -3,5 +3,5 @@
   "preferredHeight": 1440,
   "requireHiDPI": true,
   "preferredRefreshRate": 60,
-  "enablePresenterMirroring": true
+  "enablePresenterMirroring": false
 }

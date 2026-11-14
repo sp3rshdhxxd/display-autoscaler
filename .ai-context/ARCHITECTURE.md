@@ -1,26 +1,41 @@
 # Architecture & Technical Design
 
 ## Tech Stack
-* **Language:** Swift (Standalone script, no external framework dependencies)
-* **Compiler:** `swiftc` (macOS native command-line Swift compiler, using `-Xlinker -undefined -Xlinker dynamic_lookup` to resolve private SkyLight symbols at runtime)
-* **Frameworks:** Foundation, CoreGraphics, IOKit
-* **Private Framework Bridge:** `SkyLight.framework` (WindowServer interface, loaded dynamically by symbols bridging)
 
-## Application Boot and Flow
-1. **Startup:** The LaunchAgent loads `$HOME/bin/display-autoscaler`.
-2. **Initialization:**
-   * Reads target configuration from `~/.config/display-autoscaler/config.json`.
-   * If config is missing, uses default fallback parameters.
-3. **Register Hardware Callback:** Registers `displayCallback` using `CGDisplayRegisterReconfigurationCallback`.
-4. **Setup Probing Timer:** Starts a 10-second background polling timer. If no external display is active, it searches for `IOFramebuffer` services via IOKit and calls `IOServiceRequestProbe` to force hardware re-detection.
-5. **Enter Run Loop:** Starts a native thread-safe `RunLoop` to keep the process and timers alive silently.
-6. **Callback Trigger (`CGDisplayReconfigurationCallBack`):**
-   * Invoked on monitor plugin/unplug or configuration change.
-   * If external monitor is active, runs the configuration injector.
-7. **Resolution Injection & Presenter Mode:**
-   * Evaluates aspect ratios dynamically matching target limits (within 5% tolerance) to prevent screen stretching.
-   * Matches preferred scaling resolution/refresh rates from configuration.
-   * Applies configurations using CoreGraphics transactions.
-   * **Graceful Fallback:** If optimized configurations fail, applies safe baseline resolutions (e.g., 1080p, 720p).
-   * **Presenter Mirroring:** If `enablePresenterMirroring` is true, configures mirroring layouts (Master/Slave relationship) dynamically using CoreGraphics configuration APIs.
-   * **Desktop Diagnostic Logger:** Generates details at `~/Desktop/display-diagnostic-report.txt` containing display diagnostics and troubleshooting tips.
+- **Language:** Swift
+- **Compiler:** macOS `swiftc`
+- **Frameworks:** Foundation and CoreGraphics
+- **Background process:** Per-user LaunchAgent
+
+The app uses CoreGraphics to enumerate modes macOS makes available and to
+configure display modes. It does not call private SkyLight APIs or create
+display modes.
+
+## Application Flow
+
+1. The LaunchAgent starts `$HOME/bin/display-autoscaler` in the logged-in GUI
+   session.
+2. The app reads `~/.config/display-autoscaler/config.json`. Invalid or
+   unreadable configuration falls back to 2560x1440, HiDPI required, 60 Hz,
+   with mirroring off.
+3. It registers a CoreGraphics display-reconfiguration callback and checks
+   already-active external displays.
+4. On connection of a new external display, it filters available modes by
+   aspect ratio and HiDPI preference, tries the preferred size and refresh
+   rate, then compatible 1080p/720p fallbacks.
+5. Mode changes and optional mirroring are applied for the current login
+   session only. If mode selection or application fails, it reports the error
+   and does not deliberately force a different unsupported mode.
+6. It writes diagnostics to
+   `~/Desktop/display-diagnostic-report.txt` at launch and when a display is
+   connected, then remains alive to receive callbacks.
+
+The app does not poll for hardware, send wake-up signals, or detect a display
+that macOS itself does not report.
+
+## Configuration
+
+`preferredWidth` and `preferredHeight` are a pair; if omitted, the app selects
+the largest available mode matching the current aspect ratio. `requireHiDPI`
+defaults to true. `preferredRefreshRate` defaults to 60 Hz. Mirroring is
+disabled unless `enablePresenterMirroring` is explicitly true.

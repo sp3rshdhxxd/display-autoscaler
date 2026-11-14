@@ -1,10 +1,5 @@
 import Foundation
 import CoreGraphics
-import IOKit
-
-// --- Bridging Private / Hardware APIs ---
-@_silgen_name("IOServiceRequestProbe")
-func IOServiceRequestProbe(_ service: io_service_t, _ options: UInt32) -> kern_return_t
 
 // Configuration JSON Model
 struct AppConfig: Codable {
@@ -14,6 +9,18 @@ struct AppConfig: Codable {
     var preferredRefreshRate: Double?
     var enablePresenterMirroring: Bool?
 }
+
+enum ConfigError: Error {
+    case invalidValues
+}
+
+let defaultConfig = AppConfig(
+    preferredWidth: 2560,
+    preferredHeight: 1440,
+    requireHiDPI: true,
+    preferredRefreshRate: 60.0,
+    enablePresenterMirroring: false
+)
 
 func log(_ message: String) {
     print(message)
@@ -25,16 +32,29 @@ func loadConfig() -> AppConfig {
     let configURL = home.appendingPathComponent(".config/display-autoscaler/config.json")
     do {
         let data = try Data(contentsOf: configURL)
-        return try JSONDecoder().decode(AppConfig.self, from: data)
+        let config = try JSONDecoder().decode(AppConfig.self, from: data)
+        let hasWidth = config.preferredWidth != nil
+        let hasHeight = config.preferredHeight != nil
+        let hasValidDimensions = hasWidth == hasHeight
+            && (config.preferredWidth.map { $0 > 0 } ?? true)
+            && (config.preferredHeight.map { $0 > 0 } ?? true)
+        let hasValidRefreshRate = config.preferredRefreshRate.map {
+            $0.isFinite && $0 > 0
+        } ?? true
+
+        guard hasValidDimensions && hasValidRefreshRate else {
+            throw ConfigError.invalidValues
+        }
+        return config
     } catch {
-        log("[display-autoscaler:warn] Could not load config.json, using defaults: \(error)")
-        return AppConfig(preferredWidth: nil, preferredHeight: nil, requireHiDPI: true, preferredRefreshRate: 60.0, enablePresenterMirroring: true)
+        log("[display-autoscaler:warn] Could not load a valid config.json, using conservative defaults: \(error)")
+        return defaultConfig
     }
 }
 
 // Helper to query detailed text descriptions of a display mode
 func getDisplayDetailsString(displayID: CGDirectDisplayID) -> String {
-    guard let mode = CGDisplayCopyDisplayMode(displayID) else {
+    guard let mode = CGDisplayCopyDisplayMode(displayID), mode.width > 0, mode.height > 0 else {
         return "Unknown Mode"
     }
     let w = mode.width
@@ -49,29 +69,6 @@ func getDisplayDetailsString(displayID: CGDirectDisplayID) -> String {
     return "\(w)x\(h) (Physical: \(pw)x\(ph)) | Refresh: \(refresh)Hz | Aspect: \(aspectStr) | HiDPI: \(isHiDPI)"
 }
 
-// --- Feature 1: Force Hardware Probing (Auto-Scanner) ---
-func forceHardwareProbe() {
-    var iterator: io_iterator_t = 0
-    let matchingDict = IOServiceMatching("IOFramebuffer")
-    let result = IOServiceGetMatchingServices(0, matchingDict, &iterator)
-    if result == KERN_SUCCESS {
-        var service = IOIteratorNext(iterator)
-        while service != 0 {
-            let kr = IOServiceRequestProbe(service, 1)
-            if kr == 0 {
-                log("[display-autoscaler:info] Triggered background hardware display probe on framebuffer service: \(service).")
-            } else {
-                log("[display-autoscaler:error] IOServiceRequestProbe failed for service \(service): \(kr)")
-            }
-            IOObjectRelease(service)
-            service = IOIteratorNext(iterator)
-        }
-        IOObjectRelease(iterator)
-    } else {
-        log("[display-autoscaler:error] IOServiceGetMatchingServices failed: \(result)")
-    }
-}
-
 // --- Feature 5: Diagnostic Desktop Logger ---
 func writeDesktopDiagnosticReport() {
     let home = FileManager.default.homeDirectoryForCurrentUser
@@ -80,14 +77,16 @@ func writeDesktopDiagnosticReport() {
     var report = "=== Display Autoscaler Diagnostics ===\n"
     report += "Generated: \(Date().description)\n\n"
     
+    let displayCapacity: UInt32 = 16
     var onlineCount: UInt32 = 0
-    CGGetOnlineDisplayList(16, nil, &onlineCount)
+    var list = [CGDirectDisplayID](repeating: 0, count: Int(displayCapacity))
+    guard CGGetOnlineDisplayList(displayCapacity, &list, &onlineCount) == .success else {
+        log("[display-autoscaler:error] Could not get the online display list for diagnostics.")
+        return
+    }
     report += "Online Displays Detected: \(onlineCount)\n"
-    
-    var list = [CGDirectDisplayID](repeating: 0, count: Int(onlineCount))
-    CGGetOnlineDisplayList(16, &list, &onlineCount)
-    
-    for (i, id) in list.enumerated() {
+
+    for (i, id) in list.prefix(Int(onlineCount)).enumerated() {
         let isBuiltin = CGDisplayIsBuiltin(id) != 0
         let isActive = CGDisplayIsActive(id) != 0
         let isMirrored = CGDisplayIsInMirrorSet(id) != 0
@@ -101,9 +100,9 @@ func writeDesktopDiagnosticReport() {
     }
     
     report += "=== Troubleshooting Tips ===\n"
-    report += "1. If TV is blank: Wait up to 10 seconds. The background auto-prober triggers port scans automatically.\n"
-    report += "2. Mirroring: If sharing slides, enable mirroring in macOS Settings or configure 'enablePresenterMirroring' in your config.json.\n"
-    report += "3. Hardware limit: Apple Silicon chips may limit standard models to 1 external display.\n"
+    report += "1. If a display is blank: Confirm macOS detects it and check the cable, adapter, dock, and display input.\n"
+    report += "2. Mirroring: Enable 'enablePresenterMirroring' in config.json to mirror an external display with the built-in display.\n"
+    report += "3. Hardware limits: The number of supported displays depends on your Mac model and connection setup.\n"
     
     do {
         try report.write(to: reportURL, atomically: true, encoding: .utf8)
@@ -114,56 +113,53 @@ func writeDesktopDiagnosticReport() {
 }
 
 func optimizeDisplaySettings(displayID: CGDirectDisplayID) {
+    guard CGDisplayIsActive(displayID) != 0, CGDisplayIsBuiltin(displayID) == 0 else {
+        return
+    }
+
     let beforeDetails = getDisplayDetailsString(displayID: displayID)
     log("[display-autoscaler:info] [BEFORE] Display ID \(displayID): \(beforeDetails)")
 
     let config = loadConfig()
-    
-    // Pass options to get all hidden and duplicate display modes
     let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
     guard let modes = CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode] else {
         log("[display-autoscaler:error] Failed to fetch display modes for ID: \(displayID)")
         return
     }
-    
-    // --- Feature 2: Dynamic Aspect-Ratio Matching ---
-    // Get current aspect ratio of the connected display
-    guard let currentMode = CGDisplayCopyDisplayMode(displayID) else { return }
+
+    guard let currentMode = CGDisplayCopyDisplayMode(displayID),
+          currentMode.width > 0, currentMode.height > 0 else {
+        log("[display-autoscaler:error] Failed to read the current display mode for ID: \(displayID)")
+        return
+    }
     let targetAspect = Double(currentMode.width) / Double(currentMode.height)
     let aspectTolerance = 0.05
-    
+
     var bestMode: CGDisplayMode? = nil
     var fallbackModes = [CGDisplayMode]()
-    
+
     for mode in modes {
         let w = Int32(mode.width)
         let h = Int32(mode.height)
-        let pw = Int32(mode.pixelWidth)
-        let isHiDPI = pw > w
-        let refresh = mode.refreshRate
         let aspect = Double(w) / Double(h)
-        
-        // Collect safe fallbacks (e.g. 1080p, 720p)
+        guard w > 0, h > 0, abs(aspect - targetAspect) <= aspectTolerance else {
+            continue
+        }
+
+        let isHiDPI = mode.pixelWidth > mode.width
+        if (config.requireHiDPI ?? true) && !isHiDPI {
+            continue
+        }
+
         if (w == 1920 && h == 1080) || (w == 1280 && h == 720) {
             fallbackModes.append(mode)
         }
-        
-        // Filters
-        if let requireHiDPI = config.requireHiDPI, requireHiDPI, !isHiDPI {
-            continue
-        }
-        
-        // Force aspect ratio alignment to prevent stretched classroom projections
-        if abs(aspect - targetAspect) > aspectTolerance {
-            continue
-        }
-        
-        // Match preferred resolution settings
+
         if let prefW = config.preferredWidth, let prefH = config.preferredHeight {
             if w == prefW && h == prefH {
                 if let currentBest = bestMode {
                     let targetRefresh = config.preferredRefreshRate ?? 60.0
-                    if abs(refresh - targetRefresh) < abs(currentBest.refreshRate - targetRefresh) {
+                    if abs(mode.refreshRate - targetRefresh) < abs(currentBest.refreshRate - targetRefresh) {
                         bestMode = mode
                     }
                 } else {
@@ -171,9 +167,15 @@ func optimizeDisplaySettings(displayID: CGDirectDisplayID) {
                 }
             }
         } else {
-            // Fallback: Pick highest resolution matching aspect ratio
             if let currentBest = bestMode {
-                if w > Int32(currentBest.width) || (w == Int32(currentBest.width) && isHiDPI) {
+                let modePixels = Double(mode.pixelWidth) * Double(mode.pixelHeight)
+                let bestPixels = Double(currentBest.pixelWidth) * Double(currentBest.pixelHeight)
+                let refreshTarget = config.preferredRefreshRate ?? 60.0
+                let bestIsHiDPI = currentBest.pixelWidth > currentBest.width
+                if modePixels > bestPixels
+                    || (modePixels == bestPixels && isHiDPI && !bestIsHiDPI)
+                    || (modePixels == bestPixels
+                        && abs(mode.refreshRate - refreshTarget) < abs(currentBest.refreshRate - refreshTarget)) {
                     bestMode = mode
                 }
             } else {
@@ -182,141 +184,164 @@ func optimizeDisplaySettings(displayID: CGDirectDisplayID) {
         }
     }
     
-    // If we found a matching optimized mode, apply it
-    var appliedSuccess = false
-    if let selected = bestMode {
-        let isSelectedHiDPI = selected.pixelWidth > selected.width
-        log("[display-autoscaler:info] Selecting Mode: \(selected.width)x\(selected.height) (Physical: \(selected.pixelWidth)x\(selected.pixelHeight)) @ \(selected.refreshRate)Hz (HiDPI: \(isSelectedHiDPI))")
-        
-        appliedSuccess = applyDisplayMode(displayID: displayID, mode: selected)
+    let sortedFallbackModes = fallbackModes.sorted {
+        Double($0.pixelWidth) * Double($0.pixelHeight)
+            > Double($1.pixelWidth) * Double($1.pixelHeight)
     }
-    
-    // --- Feature 3: Graceful Fallbacks ---
-    // If the optimized mode fails to apply or no mode was found, apply a standard safe fallback
-    if !appliedSuccess {
-        log("[display-autoscaler:warn] Applying optimized mode failed or was not found. Attempting safe baseline fallback...")
-        for fallback in fallbackModes.sorted(by: { $0.width > $1.width }) {
-            if applyDisplayMode(displayID: displayID, mode: fallback) {
-                log("[display-autoscaler:info] Graceful fallback successful.")
-                appliedSuccess = true
-                break
-            }
+
+    var candidates = [CGDisplayMode]()
+    if let bestMode {
+        candidates.append(bestMode)
+    }
+    candidates.append(contentsOf: sortedFallbackModes.filter { fallback in
+        !candidates.contains(where: { isSameDisplayMode($0, fallback) })
+    })
+
+    guard !candidates.isEmpty else {
+        log("[display-autoscaler:warn] No suitable display mode found; leaving the current mode unchanged.")
+        return
+    }
+
+    var modeApplied = false
+    for candidate in candidates {
+        let isSelectedHiDPI = candidate.pixelWidth > candidate.width
+        log("[display-autoscaler:info] Trying Mode: \(candidate.width)x\(candidate.height) (Physical: \(candidate.pixelWidth)x\(candidate.pixelHeight)) @ \(candidate.refreshRate)Hz (HiDPI: \(isSelectedHiDPI))")
+        if isSameDisplayMode(currentMode, candidate) {
+            log("[display-autoscaler:info] Display already uses this mode.")
+            modeApplied = true
+            break
         }
+        if applyDisplayMode(displayID: displayID, mode: candidate) {
+            modeApplied = true
+            break
+        }
+        log("[display-autoscaler:warn] Mode failed; trying the next compatible option.")
     }
-    
-    // --- Feature 4: Presenter Mirroring ---
-    // Automatically configure mirroring if configured and external display is optimized
-    if appliedSuccess && (config.enablePresenterMirroring ?? true) {
+
+    guard modeApplied else {
+        log("[display-autoscaler:warn] Could not apply the selected mode; leaving the current mode unchanged.")
+        return
+    }
+
+    if config.enablePresenterMirroring ?? false {
         configureMirroring(targetDisplayID: displayID)
     }
+}
+
+func isSameDisplayMode(_ first: CGDisplayMode, _ second: CGDisplayMode) -> Bool {
+    let sameDimensions = first.width == second.width
+        && first.height == second.height
+        && first.pixelWidth == second.pixelWidth
+        && first.pixelHeight == second.pixelHeight
+    let sameRefreshRate = first.refreshRate == 0 || second.refreshRate == 0
+        || abs(first.refreshRate - second.refreshRate) < 0.5
+    return sameDimensions && sameRefreshRate
 }
 
 func applyDisplayMode(displayID: CGDirectDisplayID, mode: CGDisplayMode) -> Bool {
     var configRef: CGDisplayConfigRef?
     let status = CGBeginDisplayConfiguration(&configRef)
-    if status == .success, let cfg = configRef {
-        let configErr = CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
-        if configErr == .success {
-            let commitErr = CGCompleteDisplayConfiguration(cfg, .permanently)
-            if commitErr == .success {
-                let afterDetails = getDisplayDetailsString(displayID: displayID)
-                log("[display-autoscaler:info] [AFTER]  Display ID \(displayID): \(afterDetails)")
-                return true
-            }
-        }
+    guard status == .success, let cfg = configRef else {
+        log("[display-autoscaler:error] Could not begin display configuration: \(status)")
+        return false
     }
-    return false
+
+    let configErr = CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
+    guard configErr == .success else {
+        CGCancelDisplayConfiguration(cfg)
+        log("[display-autoscaler:error] Could not configure display mode: \(configErr)")
+        return false
+    }
+
+    let commitErr = CGCompleteDisplayConfiguration(cfg, .forSession)
+    guard commitErr == .success else {
+        log("[display-autoscaler:error] Could not commit display mode for this session: \(commitErr)")
+        return false
+    }
+
+    let afterDetails = getDisplayDetailsString(displayID: displayID)
+    log("[display-autoscaler:info] [AFTER]  Display ID \(displayID): \(afterDetails)")
+    return true
 }
 
 func configureMirroring(targetDisplayID: CGDirectDisplayID) {
-    log("[display-autoscaler:info] Reconfiguring presenter mirroring...")
+    guard CGDisplayIsInMirrorSet(targetDisplayID) == 0 else {
+        log("[display-autoscaler:info] Display \(targetDisplayID) is already in a mirror set.")
+        return
+    }
+
+    let displayCapacity: UInt32 = 16
+    var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(displayCapacity))
+    var activeCount: UInt32 = 0
+    guard CGGetActiveDisplayList(displayCapacity, &activeDisplays, &activeCount) == .success,
+          let masterID = activeDisplays.prefix(Int(activeCount)).first(where: { CGDisplayIsBuiltin($0) != 0 }) else {
+        log("[display-autoscaler:warn] Cannot mirror: no active built-in display was found.")
+        return
+    }
+
     var configRef: CGDisplayConfigRef?
     let status = CGBeginDisplayConfiguration(&configRef)
-    if status == .success, let cfg = configRef {
-        // Mirror the built-in display to the external display
-        let main = CGMainDisplayID()
-        let isMainBuiltin = CGDisplayIsBuiltin(main) != 0
-        
-        let masterID = isMainBuiltin ? main : targetDisplayID
-        let slaveID = isMainBuiltin ? targetDisplayID : main
-        
-        let mirrorErr = CGConfigureDisplayMirrorOfDisplay(cfg, slaveID, masterID)
-        if mirrorErr == .success {
-            let commitErr = CGCompleteDisplayConfiguration(cfg, .permanently)
-            if commitErr == .success {
-                log("[display-autoscaler:info] Presenter Mirroring committed successfully. Master ID \(masterID) -> Slave ID \(slaveID)")
-            } else {
-                log("[display-autoscaler:error] Mirroring commit failed.")
-            }
-        } else {
-            log("[display-autoscaler:error] CGConfigureDisplayMirrorOfDisplay failed: \(mirrorErr)")
-        }
+    guard status == .success, let cfg = configRef else {
+        log("[display-autoscaler:error] Could not begin mirroring configuration: \(status)")
+        return
+    }
+
+    let mirrorErr = CGConfigureDisplayMirrorOfDisplay(cfg, targetDisplayID, masterID)
+    guard mirrorErr == .success else {
+        CGCancelDisplayConfiguration(cfg)
+        log("[display-autoscaler:error] Could not configure display mirroring: \(mirrorErr)")
+        return
+    }
+
+    let commitErr = CGCompleteDisplayConfiguration(cfg, .forSession)
+    if commitErr == .success {
+        log("[display-autoscaler:info] Mirroring enabled for this session. Master ID \(masterID) -> Slave ID \(targetDisplayID)")
+    } else {
+        log("[display-autoscaler:error] Could not commit mirroring for this session: \(commitErr)")
     }
 }
 
 func optimizeAllExternalDisplays() {
+    let displayCapacity: UInt32 = 16
+    var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(displayCapacity))
     var activeCount: UInt32 = 0
-    CGGetActiveDisplayList(16, nil, &activeCount)
-    
-    var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(activeCount))
-    if CGGetActiveDisplayList(16, &activeDisplays, &activeCount) == .success {
-        log("[display-autoscaler:info] Active display count: \(activeCount)")
-        var hasExternal = false
-        for i in 0..<Int(activeCount) {
-            let disp = activeDisplays[i]
-            let isBuiltin = CGDisplayIsBuiltin(disp) != 0
-            log("[display-autoscaler:info] Active Display [\(i)]: ID=\(disp), Builtin=\(isBuiltin)")
-            if !isBuiltin {
-                hasExternal = true
-                optimizeDisplaySettings(displayID: disp)
-            }
-        }
-        
-        // Write diagnostic report after configuration changes
-        writeDesktopDiagnosticReport()
-        
-        // --- Feature 1: Force Hardware Probing Timer ---
-        // If no external display is active, trigger hardware re-probe timer setup
-        if !hasExternal {
-            log("[display-autoscaler:info] No external screen active. Background auto-scanner active.")
+    guard CGGetActiveDisplayList(displayCapacity, &activeDisplays, &activeCount) == .success else {
+        log("[display-autoscaler:error] Could not get the active display list.")
+        return
+    }
+
+    log("[display-autoscaler:info] Active display count: \(activeCount)")
+    for (index, displayID) in activeDisplays.prefix(Int(activeCount)).enumerated() {
+        let isBuiltin = CGDisplayIsBuiltin(displayID) != 0
+        log("[display-autoscaler:info] Active Display [\(index)]: ID=\(displayID), Builtin=\(isBuiltin)")
+        if !isBuiltin {
+            optimizeDisplaySettings(displayID: displayID)
         }
     }
+
+    writeDesktopDiagnosticReport()
 }
 
 let displayCallback: CGDisplayReconfigurationCallBack = { (displayID, flags, userInfo) in
-    if !flags.contains(.beginConfigurationFlag) {
-        log("[display-autoscaler:info] Reconfiguration complete callback for Display ID \(displayID). Flags rawValue: \(flags.rawValue)")
-        optimizeAllExternalDisplays()
+    if flags.contains(.addFlag), CGDisplayIsBuiltin(displayID) == 0 {
+        log("[display-autoscaler:info] External display connected. ID: \(displayID)")
+        DispatchQueue.main.async {
+            optimizeDisplaySettings(displayID: displayID)
+            writeDesktopDiagnosticReport()
+        }
     }
 }
 
 log("[display-autoscaler:info] Starting display agent. Registering callback...")
 let context = UnsafeMutableRawPointer(bitPattern: 0)
-CGDisplayRegisterReconfigurationCallback(displayCallback, context)
+let callbackStatus = CGDisplayRegisterReconfigurationCallback(displayCallback, context)
+guard callbackStatus == .success else {
+    log("[display-autoscaler:error] Could not register the display callback: \(callbackStatus)")
+    exit(EXIT_FAILURE)
+}
 
 // Trigger initial optimization
 optimizeAllExternalDisplays()
 
-// Setup periodic background probing timer (runs every 10 seconds)
-let timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { _ in
-    var activeCount: UInt32 = 0
-    CGGetActiveDisplayList(16, nil, &activeCount)
-    var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(activeCount))
-    if CGGetActiveDisplayList(16, &activeDisplays, &activeCount) == .success {
-        var hasExternal = false
-        for disp in activeDisplays {
-            if CGDisplayIsBuiltin(disp) == 0 {
-                hasExternal = true
-                break
-            }
-        }
-        // Only trigger hardware scan if no external displays are currently online
-        if !hasExternal {
-            forceHardwareProbe()
-        }
-    }
-}
-
-// Run the loop to keep the process and timers alive
-RunLoop.current.add(timer, forMode: .common)
+// Keep the process alive to receive display reconfiguration callbacks.
 RunLoop.current.run()

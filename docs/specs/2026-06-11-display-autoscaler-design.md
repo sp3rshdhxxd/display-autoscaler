@@ -1,71 +1,52 @@
-# Design Specification: display-autoscaler
+# Design: display-autoscaler
 
-A minimalist, zero-UI background utility written in Swift that detects external display connections and programmatically applies optimal Retina (HiDPI) resolution scaling using macOS private SkyLight APIs.
+`display-autoscaler` is an experimental, no-UI macOS utility written in Swift.
+It runs as a per-user LaunchAgent and configures external display modes using
+the public CoreGraphics APIs.
 
-## 1. Project Directory Structure
+## Runtime Flow
 
-```
-display-autoscaler/
-├── .ai-context/
-│   ├── PROJECT_OVERVIEW.md
-│   ├── ARCHITECTURE.md
-│   ├── DEVELOPMENT_LOG.md
-│   └── DESIGN.md
-├── docs/
-│   └── specs/
-│       └── 2026-06-11-display-autoscaler-design.md
-├── config.json.template
-├── main.swift
-├── install.sh
-└── uninstall.sh
-```
+1. The LaunchAgent starts the binary in the user's GUI session.
+2. The app reads `~/.config/display-autoscaler/config.json`.
+3. It registers `CGDisplayRegisterReconfigurationCallback` and inspects
+   active external displays at startup.
+4. On a new external display connection, it examines modes returned by
+   `CGDisplayCopyAllDisplayModes`.
+5. Candidate modes are filtered by the current aspect ratio and HiDPI setting.
+   The configured logical resolution and nearest refresh rate are preferred.
+   If unavailable or not applicable, compatible 1080p or 720p modes are tried.
+6. Resolution changes and explicitly enabled mirroring are applied for the
+   current login session using CoreGraphics display configuration transactions.
+7. The app writes `~/Desktop/display-diagnostic-report.txt` and remains alive
+   for future connection callbacks.
 
----
+The app does not use private SkyLight mode APIs, create modes, poll IOKit, or
+send display wake-up signals. It cannot act on a display macOS does not detect.
 
-## 2. Core Components
+## Configuration
 
-### A. Private SkyLight API Bridge
-Since macOS filters out custom Retina scaling resolutions on third-party monitors through public APIs, we bridge private `SkyLight.framework` symbols. We define a robust display mode structure mapping to avoid fragile offset array lookups.
+The configuration path is `~/.config/display-autoscaler/config.json`.
 
-#### Swift Declarations
-```swift
-struct CGSDisplayMode {
-    var modeNumber: Int32
-    var flags: Int32
-    var width: Int32
-    var height: Int32
-    var depth: Int32
-    var refreshRate: Double
-    var density: Int32 // 1 = LoDPI, 2 = HiDPI (Retina)
-    // Extra fields to match physical structure padding...
-}
-```
+| Key | Behavior |
+| --- | --- |
+| `preferredWidth`, `preferredHeight` | Positive integers used together as the preferred logical resolution. Omit both to select the largest matching mode. |
+| `requireHiDPI` | Excludes modes whose pixel dimensions do not exceed their logical dimensions. Defaults to `true`. |
+| `preferredRefreshRate` | Chooses the nearest available refresh rate for the preferred resolution. Defaults to 60 Hz. |
+| `enablePresenterMirroring` | Opts into mirroring the external display with the active built-in display. Defaults to `false`. |
 
-We link the following system functions using `@_silgen_name`:
-* `CGSGetNumDisplayModes`
-* `CGSGetDisplayModeDescriptionOfLength`
-* `CGSConfigureDisplayMode`
+Invalid configuration falls back to conservative built-in defaults. If no
+compatible mode can be selected or applied, the app logs the issue and leaves
+the current mode unchanged.
 
-### B. Display Hot-Plug Detection
-Instead of CPU-intensive polling, we register a callback with the macOS windowing engine:
-```swift
-CGDisplayRegisterReconfigurationCallback(displayCallback, nil)
-```
-When `flags.contains(.addFlag)` fires:
-1. Validate it is an external screen (`CGDisplayIsBuiltin(displayID) == 0`).
-2. Query and optimize resolution modes for the newly added display.
+## Installation
 
-### C. Resolution Configuration (JSON)
-Located at `~/.config/display-autoscaler/config.json`:
-* `preferredWidth`: Target width (e.g. `2560`)
-* `preferredHeight`: Target height (e.g. `1440`)
-* `requireHiDPI`: Boolean to force Retina scaling (defaults to `true`)
-* `preferredRefreshRate`: Target refresh rate (defaults to `60.0`)
+`install.sh` compiles the Swift source, installs the binary in `~/bin`, creates
+the per-user LaunchAgent, and copies `config.json.template` only if no live
+configuration already exists. `uninstall.sh` unloads the agent and removes the
+binary and plist; it keeps the user's configuration and logs.
 
----
+## Limitations
 
-## 3. Installation & LaunchAgent
-1. Compile into a standalone binary: `swiftc -O main.swift -o display-autoscaler`
-2. Move binary to `/usr/local/bin/`
-3. Generate LaunchAgent plist `com.user.display-autoscaler.plist` in `~/Library/LaunchAgents/`
-4. Load agent: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.display-autoscaler.plist`
+Available modes and their behavior depend on macOS, the display, and any
+adapters or docks in use. The project has no automated hardware test suite.
+Test the complete display setup before relying on automatic changes.

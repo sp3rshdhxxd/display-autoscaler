@@ -1,22 +1,39 @@
 #!/bin/bash
 set -e
 
-echo "[Install] Compiling Swift source..."
-swiftc -O main.swift -o display-autoscaler -Xlinker -undefined -Xlinker dynamic_lookup
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if ! command -v swiftc >/dev/null 2>&1; then
+    echo "[Install] swiftc was not found. Install the Xcode Command Line Tools first." >&2
+    exit 1
+fi
 
-echo "[Install] Copying executable to $HOME/bin..."
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/display-autoscaler.XXXXXX")"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
+echo "[Install] Compiling Swift source..."
+swiftc -O "$SCRIPT_DIR/main.swift" -o "$BUILD_DIR/display-autoscaler"
+
+echo "[Install] Installing executable to $HOME/bin..."
 mkdir -p "$HOME/bin"
-cp display-autoscaler "$HOME/bin/display-autoscaler"
+cp "$BUILD_DIR/display-autoscaler" "$HOME/bin/display-autoscaler"
 
 echo "[Install] Setting up configuration directory..."
 mkdir -p "$HOME/.config/display-autoscaler"
 if [ ! -f "$HOME/.config/display-autoscaler/config.json" ]; then
-    cp config.json "$HOME/.config/display-autoscaler/config.json"
+    cp "$SCRIPT_DIR/config.json.template" "$HOME/.config/display-autoscaler/config.json"
     echo "[Install] Default configuration created at $HOME/.config/display-autoscaler/config.json"
 fi
 
 echo "[Install] Creating LaunchAgent plist..."
 AGENT_PLIST="$HOME/Library/LaunchAgents/com.user.display-autoscaler.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+GUI_DOMAIN="gui/$(id -u)"
+
+if launchctl print "$GUI_DOMAIN/com.user.display-autoscaler" >/dev/null 2>&1; then
+    echo "[Install] Stopping the existing LaunchAgent..."
+    launchctl bootout "$GUI_DOMAIN/com.user.display-autoscaler"
+fi
+
 cat <<EOF > "$AGENT_PLIST"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -44,8 +61,9 @@ cat <<EOF > "$AGENT_PLIST"
 </plist>
 EOF
 
+plutil -lint "$AGENT_PLIST"
 echo "[Install] Loading LaunchAgent..."
-launchctl bootstrap gui/$(id -u) "$AGENT_PLIST" || true
-launchctl kickstart -k "gui/$(id -u)/com.user.display-autoscaler" || true
+launchctl bootstrap "$GUI_DOMAIN" "$AGENT_PLIST"
+launchctl kickstart -k "$GUI_DOMAIN/com.user.display-autoscaler"
 
 echo "[Install] Installation completed successfully!"

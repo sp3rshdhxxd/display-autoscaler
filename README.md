@@ -1,32 +1,97 @@
-# Imagine if all of these monitor projecting could become easier
+# display-autoscaler
 
-Seriously, plug-and-play is a total lie. 
+`display-autoscaler` is a small, experimental macOS background utility written in
+Swift. It looks for active external displays and selects a display mode from the
+modes macOS reports as available. It can optionally mirror an external display
+with the built-in display.
 
-## The Struggles of Modern Displays (Why everything is currently broken)
+It does not create display modes, guarantee HiDPI scaling, wake a sleeping
+display, repair HDMI/DisplayPort connections, or guarantee that a selected mode
+will look right on every monitor or projector. It uses public CoreGraphics
+display APIs for mode selection. macOS and hardware behavior vary; test with
+your displays before relying on it for a presentation.
 
-We’ve all been there. You walk into a classroom, a meeting room, or some random co-working space, and you just want to show your screen. Sounds simple, right? Wrong. 
+## What it does
 
-Here is what actually happens:
+- On launch, checks active external displays and tries to select the configured
+  resolution and refresh rate.
+- On a newly connected display, repeats that mode selection.
+- Requires HiDPI modes by default. If the preferred mode is unavailable, it
+  tries a listed 1080p or 720p mode that meets the same aspect-ratio and HiDPI
+  filters. If no suitable mode exists or applying one fails, it leaves the
+  current mode unchanged.
+- Writes a diagnostics report to
+  `~/Desktop/display-diagnostic-report.txt` at launch and when a display is
+  connected.
+- Leaves mirroring disabled by default. Enable it explicitly in the config if
+  you want the app to mirror the built-in display to an external one.
 
-1. **The "No Signal" Ghost Town:** You plug the HDMI cable into your Mac. *Nothing happens.* The TV is black. Your laptop is acting like nothing happened. You unplug it, blow on it like an old Nintendo cartridge, plug it back in... still nothing. You have to awkwardly go into settings, hold Option, and click some hidden "Detect Displays" button. Meanwhile, everyone is staring at you waiting for the presentation to start.
-2. **The Blurry-Text Headache:** You finally get a picture, but it looks like you forgot to put your glasses on. The text is so blurry and fuzzy because macOS decides your beautiful 4K TV or nice 1440p monitor only deserves standard low-res scaling (LoDPI). Trying to read code or slides on it makes your eyes bleed.
-3. **The Squished-Screen Nightmare:** You plug into a projector, and suddenly your circular diagrams look like squashed eggs. The aspect ratio is completely messed up, stretching your screen horizontally because macOS just guessed the wrong dimensions.
-4. **The Mirroring Drag:** You just want to mirror your screen so you can look at your laptop while presenting. Instead, macOS extends the desktop, and you have to awkwardly drag your slides off the side of your screen while looking backward at the TV.
-5. **The Black Screen Crash:** You try to set a high resolution, and the old school projector just gives up and displays "Out of Range" or goes completely black. 
+Display changes are applied for the current login session; the app does not ask
+for administrator privileges. The utility has no graphical interface. Its
+LaunchAgent output is written to `~/Library/Logs/display-autoscaler.log`.
 
----
+## Requirements
 
-## What This Utility Actually Does (The Fix)
+- macOS with Swift installed (the Xcode Command Line Tools provide `swiftc`).
+- An account logged in to the macOS graphical session.
 
-I built a tiny, silent background app (`display-autoscaler`) that runs on your Mac and fixes all this junk automatically. 
+## Install
 
-Here is what it does for you:
+From the repository directory, run:
 
-* **Auto-Probing (The Zero-Effort Connection):** It runs a background scanner every 10 seconds. If you plug in an HDMI cable and the TV does not wake up, the app forces the graphics card to send a hardware pulse down the cable. No more unplugging and replugging. It just wakes the TV up for you.
-* **Aspect-Ratio Matching:** It checks the exact shape of the connected screen (widescreen, square, whatever) and automatically selects the highest resolution matching that *exact* ratio. No more stretched, squished, or warped presentations.
-* **Force HiDPI (Retina Scaling):** It bypasses Apple's default filters to unlock hidden Retina scaling profiles. You get ultra-sharp, crisp 5K-rendered text on normal 4K or 1440p external screens.
-* **Graceful Fallbacks:** If a high-res setting fails or the projector can't handle it, the app detects the error and instantly falls back to a safe baseline (like standard 1080p) so you *always* get a picture.
-* **Automatic Mirroring:** It automatically turns on mirroring when you connect to a TV or projector so your presentation is instantly visible on both screens.
-* **Desktop Diagnostics:** Every time you connect a display, it dumps a super simple text file on your desktop (`display-diagnostic-report.txt`) showing exactly what displays are active, what resolution is applied, and troubleshooting tips.
+```sh
+./install.sh
+```
 
-Now, you just plug in the cable, wait a few seconds, and it just works. No settings, no menus, no panic.
+The script compiles the app, installs it under `~/bin`, copies the default
+configuration if one does not already exist, and loads a LaunchAgent for the
+current user. It does not replace an existing config file.
+
+To uninstall:
+
+```sh
+./uninstall.sh
+```
+
+Uninstall removes the LaunchAgent and executable. It leaves the configuration
+and log files in place.
+
+## Configuration
+
+The live configuration is `~/.config/display-autoscaler/config.json`:
+
+```json
+{
+  "preferredWidth": 2560,
+  "preferredHeight": 1440,
+  "requireHiDPI": true,
+  "preferredRefreshRate": 60,
+  "enablePresenterMirroring": false
+}
+```
+
+`preferredWidth` and `preferredHeight` must both be positive integers or both
+be omitted. When provided, the app selects that logical resolution and the
+available refresh rate nearest to `preferredRefreshRate`. When omitted, it
+chooses the largest listed mode matching the current aspect ratio. With
+`requireHiDPI` enabled, non-HiDPI modes are excluded, including fallbacks.
+`enablePresenterMirroring` is opt-in because it changes the desktop layout.
+
+Changes to the config are read when the app processes a newly connected
+display; restart the LaunchAgent to apply them immediately. To restart it:
+
+```sh
+launchctl kickstart -k "gui/$(id -u)/com.user.display-autoscaler"
+```
+
+## Limitations
+
+- The app can only choose modes that macOS exposes for the display. It cannot
+  unlock hidden modes or promise that macOS will expose a HiDPI option.
+- A mode listed by macOS can still fail to apply. In that case the app tries a
+  compatible fallback and otherwise leaves the current mode unchanged.
+- The app cannot detect or fix a display that macOS does not detect.
+- Automatic mirroring and resolution changes can disrupt active work. Keep
+  mirroring disabled unless you explicitly want that behavior.
+- This project has no automated hardware test suite. Validate it with your
+  monitor, adapter, dock, and macOS version before depending on it.
